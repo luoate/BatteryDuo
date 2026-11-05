@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """ATK A9 Ultimate + 狼蛛 A7 Pro 双托盘电量监控（Windows 11）。
 
-右下角同时显示两个独立托盘图标：M=鼠标、H=耳机；不用切换设备。
+右下角同时显示鼠标、耳机 SVG 和各自电量；不用切换设备。
 ATK 按间隔查询；A7 Pro 在另一个线程监听 FF90/0x55 事件，
 可通过右键菜单手动启用实验性 60 秒以上主动查询。
 """
@@ -17,11 +17,14 @@ import threading
 import time
 import winreg
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QLockFile, QRect, QThread, QTimer, QStandardPaths, Signal
-from PySide6.QtGui import QActionGroup, QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtCore import Qt, QLockFile, QRectF, QThread, QTimer, QStandardPaths, Signal
+from PySide6.QtGui import QActionGroup, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QMenu, QProgressBar,
+                               QSystemTrayIcon, QVBoxLayout, QWidget, QWidgetAction)
 
 import atk_a9_battery as atk
 import aula_a7pro_battery as aula
@@ -38,10 +41,11 @@ THRESHOLDS = (5, 10, 15, 20, 25, 30)
 ICON_SIZES = (16, 20, 24, 32, 48)
 PUSH_STALE_S = 1800  # 耳机超过 30 分钟未有新消息，显示为旧数据（灰色）
 DEFAULTS = {"interval_s": 60, "warn_percent": 20, "notify_low": True,
-            "show_digits": True, "headset_active_poll": False}
+            "headset_active_poll": False}
 DIGITS_LIGHT_TASKBAR = {"high": "#1E8E4E", "mid": "#A86200", "low": "#C6363C", "idle": "#525252"}
 DIGITS_DARK_TASKBAR = {"high": "#4CC38A", "mid": "#F5A524", "low": "#F0555C", "idle": "#BDBDBD"}
-TAG_COLORS = {"mouse": "#26B7F1", "headset": "#BD86FF"}  # M=青色，H=紫色
+TAG_COLORS = {"mouse": "#26B7F1", "headset": "#BD86FF"}
+ASSET_NAMES = {"mouse": "鼠标滚轮.svg", "headset": "耳机.svg"}
 
 
 def config_dir() -> Path:
@@ -55,7 +59,7 @@ def fmt_interval(seconds: int) -> str:
 def theme_is_light() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, THEME_KEY) as key:
-            return bool(winreg.QueryValueEx(key, "AppsUseLightTheme")[0])
+            return bool(winreg.QueryValueEx(key, "SystemUsesLightTheme")[0])
     except OSError:
         return False
 
@@ -76,81 +80,70 @@ def digit_color(percent: int | None, stale: bool = False) -> QColor:
     return QColor(palette[label])
 
 
-def _fitted_font(text: str, size: int, width: int) -> QFont:
-    font = QFont("Segoe UI")
-    font.setBold(True)
-    font.setStretch(QFont.SemiCondensed)
-    font.setStyleStrategy(QFont.PreferAntialias)
-    font.setPixelSize(size)
-    while font.pixelSize() > 6 and QFontMetrics(font).horizontalAdvance(text) > width:
-        font.setPixelSize(font.pixelSize() - 1)
-    return font
-
-
-def paint_percent(size: int, percent: int | None, charging: bool,
-                  stale: bool, key: str) -> QPixmap:
-    """顶部固定 M/H 身份标志，底部始终显示各自电量数字。"""
+@lru_cache(maxsize=128)
+def device_pixmap(key: str, size: int, color: str) -> QPixmap:
+    """从源码目录或 PyInstaller 资源目录加载 SVG，按主题着色。"""
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    renderer = QSvgRenderer(str(root / ASSET_NAMES[key]))
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
-    p.setRenderHint(QPainter.TextAntialiasing, True)
-    p.setRenderHint(QPainter.Antialiasing, True)
-    tag = "M" if key == "mouse" else "H"
-    label_height = max(5, int(size * 0.31))
-    tag_font = _fitted_font(tag, max(6, int(size * 0.34)), size)
-    p.setFont(tag_font)
-    p.setPen(QColor(TAG_COLORS[key]))
-    p.drawText(QRect(0, 0, size, label_height + 1), Qt.AlignHCenter | Qt.AlignTop, tag)
-
-    value = "--" if percent is None and not stale else "?" if percent is None else str(percent)
-    number_bottom = size - (2 if charging and not stale else 0)
-    number_h = max(5, number_bottom - label_height)
-    font = _fitted_font(value, max(7, int(size * 0.72)), size - 1)
-    p.setFont(font)
-    p.setPen(digit_color(percent, stale))
-    p.drawText(QRect(0, label_height - 1, size, number_h + 1), Qt.AlignHCenter | Qt.AlignVCenter, value)
-    if charging and not stale:
-        p.fillRect(QRect(1, size - max(1, size // 12), size - 2, max(1, size // 12)), QColor("#4587FF"))
+    p.setRenderHint(QPainter.Antialiasing)
+    if renderer.isValid():
+        renderer.render(p, QRectF(0, 0, size, size))
+    else:
+        # 素材被移动时仍保留可辨认的设备轮廓。
+        p.setPen(QPen(Qt.white, max(1.0, size / 12)))
+        if key == "mouse":
+            p.drawRoundedRect(QRectF(size * .24, size * .08, size * .52, size * .84),
+                              size * .24, size * .24)
+            p.drawLine(int(size * .5), int(size * .22), int(size * .5), int(size * .42))
+        else:
+            p.drawArc(QRectF(size * .14, size * .1, size * .72, size * .72), 0, 180 * 16)
+            for x in (.12, .7):
+                p.drawRoundedRect(QRectF(size * x, size * .43, size * .18, size * .4), 1, 1)
+    p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    p.fillRect(pm.rect(), QColor(color))
     p.end()
     return pm
 
 
 def paint_battery(size: int, percent: int | None, charging: bool,
                   stale: bool, key: str) -> QPixmap:
-    """可选电池图案：左上角 M/H，电量填充随百分比变化。"""
+    """大设备轮廓 + 底部电量条，将有限的托盘空间留给图案。"""
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing, True)
-    label = "M" if key == "mouse" else "H"
-    font = _fitted_font(label, max(6, int(size * 0.35)), size)
-    p.setFont(font)
-    p.setPen(QColor(TAG_COLORS[key]))
-    p.drawText(QRect(0, 0, size, int(size * 0.35) + 2), Qt.AlignHCenter | Qt.AlignTop, label)
-    x = max(1, size // 10)
-    y = int(size * 0.48)
-    w = max(5, int(size * 0.76))
-    h = max(3, int(size * 0.37))
-    p.setPen(QPen(digit_color(None, True), max(1, size // 16)))
-    p.setBrush(Qt.NoBrush)
-    p.drawRoundedRect(x, y, w, h, 1, 1)
-    p.fillRect(QRect(x + w + 1, y + h // 3, max(1, size // 12), max(1, h // 3)),
-               digit_color(None, True))
-    if percent is not None and not stale and percent > 0:
-        fill = max(1, (w - 3) * percent // 100)
-        p.fillRect(QRect(x + 2, y + 2, fill, max(1, h - 3)), digit_color(percent))
+    bar_h = max(2, round(size * .12))
+    gap = max(1, round(size * .04))
+    glyph_size = size - bar_h - gap
+    color = digit_color(None, True).name() if stale or percent is None else TAG_COLORS[key]
+    p.drawPixmap((size - glyph_size) // 2, 0, device_pixmap(key, glyph_size, color))
+
+    margin = max(1, round(size * .06))
+    bar = QRectF(margin, size - bar_h, size - 2 * margin, bar_h)
+    track = QColor("#CFD6DF" if theme_is_light() else "#465365")
+    p.setPen(Qt.NoPen)
+    p.setBrush(track)
+    p.drawRoundedRect(bar, bar_h / 2, bar_h / 2)
+    if percent is not None and percent > 0:
+        fill = QRectF(bar.x(), bar.y(), max(1, bar.width() * percent / 100), bar.height())
+        p.setBrush(digit_color(percent, stale))
+        p.drawRoundedRect(fill, bar_h / 2, bar_h / 2)
     if charging and not stale:
-        p.fillRect(QRect(1, size - 1, size - 2, 1), QColor("#4587FF"))
+        # 蓝点表示耳机正在充电，不再额外挤占底部图标空间。
+        dot = max(2, round(size * .14))
+        p.setBrush(QColor("#4587FF"))
+        p.drawEllipse(QRectF(size - dot, 0, dot, dot))
     p.end()
     return pm
 
 
-def build_icon(percent: int | None, charging: bool, stale: bool,
-               key: str, digits: bool = True) -> QIcon:
+def build_icon(percent: int | None, charging: bool, stale: bool, key: str) -> QIcon:
     icon = QIcon()
-    painter = paint_percent if digits else paint_battery
     for size in icon_sizes():
-        icon.addPixmap(painter(size, percent, charging, stale, key))
+        icon.addPixmap(paint_battery(size, percent, charging, stale, key))
     return icon
 
 
@@ -234,7 +227,7 @@ class DeviceTray:
         self.reader = BatteryReader(driver, owner.cfg["interval_s"])
         self.reader.ok.connect(self.on_status)
         self.reader.err.connect(self.on_error)
-        self.tray = QSystemTrayIcon(build_icon(None, False, False, key, owner.cfg["show_digits"]))
+        self.tray = QSystemTrayIcon(build_icon(None, False, False, key))
         self.tray.setToolTip(f"{driver.name}：等待电量…")
         self.tray.activated.connect(self.on_activated)
         self.actions: dict = {}
@@ -248,14 +241,14 @@ class DeviceTray:
     def repaint(self) -> None:
         st = self.status
         self.tray.setIcon(build_icon(st.percent if st else None,
-                                     st.wired_flag if st else False,
-                                     self.is_stale, self.key, self.owner.cfg["show_digits"]))
+                                     st.wired_flag if st and self.key == "headset" else False,
+                                     self.is_stale, self.key))
         # 悬浮在任意一个图标上，都能快速看到两种设备。
         self.tray.setToolTip(self.owner.tooltip())
 
     def on_activated(self, reason) -> None:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            # 点击 M 刷新鼠标；点击 H 在已启用主动查询时刷新耳机。
+            # 点击设备图标刷新；耳机需已启用主动查询。
             self.reader.refresh_now()
 
     def on_status(self, status: BatteryStatus) -> None:
@@ -288,7 +281,7 @@ class DeviceTray:
         self.owner.update_icons_and_menus()
 
     def summary(self) -> str:
-        short = "鼠标 M" if self.key == "mouse" else "耳机 H"
+        short = "鼠标" if self.key == "mouse" else "耳机"
         if self.status is None:
             return f"{short}：--%" + ("（读取失败）" if self.error else "（等待数据）")
         parts = [f"{short}：{self.status.percent}%"]
@@ -315,6 +308,77 @@ class DeviceTray:
             return f"耳机更新于 {updated}（{age} 分钟前）{note}"
         volt = f"｜{self.status.voltage_mv} mV" if self.status and self.status.voltage_mv else ""
         return f"鼠标更新于 {updated}{volt}{note}"
+
+
+class DeviceStatusCard(QWidget):
+    """菜单中的只读设备卡片，保留历史/异常信息，不占用菜单操作项。"""
+    def __init__(self, parent: QMenu):
+        super().__init__(parent)
+        self.setObjectName("deviceCard")
+        self.setFixedWidth(332)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.glyph = QLabel()
+        self.glyph.setFixedSize(28, 28)
+        self.title = QLabel()
+        self.title.setObjectName("deviceTitle")
+        self.value = QLabel()
+        self.value.setObjectName("batteryValue")
+        row.addWidget(self.glyph)
+        row.addWidget(self.title, 1)
+        row.addWidget(self.value)
+        layout.addLayout(row)
+        self.state = QLabel()
+        self.detail = QLabel()
+        self.detail.setObjectName("deviceDetail")
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(4)
+        layout.addWidget(self.state)
+        layout.addWidget(self.bar)
+        layout.addWidget(self.detail)
+
+    def sync(self, device: DeviceTray) -> None:
+        light = theme_is_light()
+        fg, muted = ("#17212F", "#64748B") if light else ("#EDF2F7", "#9CAABD")
+        bg, track = ("#F1F5F9", "#DCE4ED") if light else ("#263141", "#3A4759")
+        st = device.status
+        color = digit_color(st.percent if st else None, device.is_stale).name()
+        accent = muted if device.is_stale or st is None else TAG_COLORS[device.key]
+        self.setStyleSheet(f"""
+            QWidget#deviceCard {{ background: {bg}; border-radius: 8px; }}
+            QLabel {{ color: {fg}; background: transparent; font: 9pt 'Segoe UI'; }}
+            QLabel#deviceTitle {{ font-weight: 600; }}
+            QLabel#batteryValue {{ color: {color}; font: bold 18pt 'Segoe UI'; }}
+            QLabel#deviceDetail {{ color: {muted}; font-size: 8pt; }}
+            QProgressBar {{ border: none; border-radius: 2px; background: {track}; }}
+            QProgressBar::chunk {{ border-radius: 2px; background: {color}; }}
+        """)
+        dpr = self.devicePixelRatioF()
+        pm = QPixmap(device_pixmap(device.key, round(28 * dpr), accent))
+        pm.setDevicePixelRatio(dpr)
+        self.glyph.setPixmap(pm)
+        self.title.setText("ATK A9 Ultimate" if device.key == "mouse" else "狼蛛 A7 Pro")
+        self.value.setText(f"{st.percent}%" if st else "--%")
+        if st is None:
+            state = "读取失败 · 等待有效数据" if device.error else "等待设备电量"
+        elif device.is_stale:
+            state = "历史电量 · 等待更新"
+        elif device.key == "headset":
+            state = "正在充电" if st.wired_flag else "电量已更新 · 未充电"
+        else:
+            state = "电量已更新"
+        self.state.setText(state)
+        self.bar.setValue(st.percent if st else 0)
+        detail = device.detail()
+        if device.error and not device.updated_at:
+            detail = "读取异常：" + device.error
+        self.detail.setText(self.detail.fontMetrics().elidedText(detail, Qt.ElideRight, 304))
+        self.setToolTip(device.summary() + "\n" + detail)
 
 
 class TrayApp:
@@ -386,29 +450,25 @@ class TrayApp:
     def _build_menu(self, device: DeviceTray) -> QMenu:
         menu = QMenu()
         acts = device.actions
-        acts["mouse"] = menu.addAction("鼠标：--%")
-        acts["mouse"].setEnabled(False)
-        acts["headset"] = menu.addAction("耳机：--%")
-        acts["headset"].setEnabled(False)
-        acts["mouse_detail"] = menu.addAction("鼠标：等待")
-        acts["mouse_detail"].setEnabled(False)
-        acts["headset_detail"] = menu.addAction("耳机：等待")
-        acts["headset_detail"].setEnabled(False)
+        for key in ("mouse", "headset"):
+            card = DeviceStatusCard(menu)
+            action = QWidgetAction(menu)
+            action.setDefaultWidget(card)
+            menu.addAction(action)
+            acts[key + "_card"] = card
         menu.addSeparator()
         menu.addAction("立即查询鼠标电量").triggered.connect(self.mouse.reader.refresh_now)
         acts["headset_query"] = menu.addAction("立即查询耳机电量")
         acts["headset_query"].triggered.connect(self.headset.reader.refresh_now)
-        acts["active_query"] = menu.addAction("启用耳机主动查询（实验性，每次≥60秒）")
+        settings = menu.addMenu("设置")
+        acts["active_query"] = settings.addAction("耳机主动查询（实验性，间隔≥60秒）")
         acts["active_query"].setCheckable(True)
         acts["active_query"].toggled.connect(self._set_headset_active_poll)
-        acts["digits"] = menu.addAction("托盘图标显示电量数字")
-        acts["digits"].setCheckable(True)
-        acts["digits"].toggled.connect(self._set_digits)
-        acts["notify"] = menu.addAction("低电量弹窗提醒")
+        acts["notify"] = settings.addAction("低电量弹窗提醒")
         acts["notify"].setCheckable(True)
         acts["notify"].toggled.connect(self._set_notify)
 
-        submenu = menu.addMenu("低电量提醒阈值（两台设备）")
+        submenu = settings.addMenu("低电量提醒阈值")
         group = QActionGroup(submenu)
         group.setExclusive(True)
         acts["warn_group"] = group
@@ -421,7 +481,7 @@ class TrayApp:
             act.triggered.connect(lambda checked=False, n=percent: self._set_warn(n))
             acts["warn_choices"][percent] = act
 
-        submenu = menu.addMenu("刷新间隔（鼠标 / 已启用的耳机主动查询）")
+        submenu = settings.addMenu("刷新间隔")
         group = QActionGroup(submenu)
         group.setExclusive(True)
         acts["interval_group"] = group
@@ -434,7 +494,7 @@ class TrayApp:
             act.triggered.connect(lambda checked=False, n=seconds: self._set_interval(n))
             acts["interval_choices"][seconds] = act
 
-        acts["autostart"] = menu.addAction("登录时自动启动")
+        acts["autostart"] = settings.addAction("登录时自动启动")
         acts["autostart"].setCheckable(True)
         acts["autostart"].toggled.connect(self._set_autostart)
         menu.addSeparator()
@@ -443,15 +503,24 @@ class TrayApp:
         return menu
 
     def _sync_menus(self) -> None:
+        light = theme_is_light()
+        bg, fg, hover, border = (("#FFFFFF", "#17212F", "#E7F1FC", "#DCE4ED") if light
+                                 else ("#1B2431", "#EDF2F7", "#30445D", "#354154"))
+        style = f"""
+            QMenu {{ background: {bg}; color: {fg}; border: 1px solid {border};
+                     padding: 6px; font: 10pt 'Segoe UI'; }}
+            QMenu::item {{ padding: 8px 28px; border-radius: 4px; }}
+            QMenu::item:selected {{ background: {hover}; }}
+            QMenu::item:disabled {{ color: #8491A3; }}
+            QMenu::separator {{ height: 1px; background: {border}; margin: 6px 8px; }}
+        """
         for device in self.devices:
             a = device.actions
-            a["mouse"].setText(self.mouse.summary())
-            a["headset"].setText(self.headset.summary())
-            a["mouse_detail"].setText(self.mouse.detail())
-            a["headset_detail"].setText(self.headset.detail())
+            device.menu.setStyleSheet(style)
+            a["mouse_card"].sync(self.mouse)
+            a["headset_card"].sync(self.headset)
             a["headset_query"].setEnabled(self.cfg["headset_active_poll"])
-            for name, value in (("digits", self.cfg["show_digits"]),
-                                ("notify", self.cfg["notify_low"]),
+            for name, value in (("notify", self.cfg["notify_low"]),
                                 ("active_query", self.cfg["headset_active_poll"]),
                                 ("autostart", autostart_enabled())):
                 act = a[name]
@@ -467,11 +536,6 @@ class TrayApp:
         for d in self.devices:
             d.repaint()
         self._sync_menus()
-
-    def _set_digits(self, on: bool) -> None:
-        self.cfg["show_digits"] = bool(on)
-        self._save_config()
-        self.update_icons_and_menus()
 
     def _set_notify(self, on: bool) -> None:
         self.cfg["notify_low"] = bool(on)
@@ -564,10 +628,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=int, choices=INTERVALS)
     parser.add_argument("--warn", type=int, choices=THRESHOLDS)
     parser.add_argument("--debug", action="store_true", help=f"记录日志到 {config_dir() / 'tray.log'}")
+    parser.add_argument("--self-test", type=Path, metavar="REPORT",
+                        help="离线验证打包后的 Qt、SVG 和菜单，将结果写入 REPORT；不访问 HID")
     args = parser.parse_args(argv)
     app = QApplication(sys.argv)
     app.setApplicationName(DISPLAY_NAME)
     app.setQuitOnLastWindowClosed(False)
+    if args.self_test:
+        # 在单实例锁和 HID 初始化之前验证，测试不启动任何读取线程。
+        for key, asset in ASSET_NAMES.items():
+            resource = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / asset
+            if not QSvgRenderer(str(resource)).isValid():
+                raise RuntimeError(f"SVG resource is invalid: {asset}")
+            for percent in (None, 0, 5, 20, 86, 100):
+                for stale in (False, True):
+                    icon = build_icon(percent, True, stale, key)
+                    if icon.pixmap(16, 16).isNull():
+                        raise RuntimeError(f"Tray icon render failed: {key}")
+        monitor = TrayApp(app, dict(DEFAULTS))
+        try:
+            for device in monitor.devices:
+                device.menu.ensurePolished()
+                device.menu.resize(device.menu.sizeHint())
+                if device.menu.grab().isNull():
+                    raise RuntimeError("Menu render failed")
+        finally:
+            monitor.shutdown()
+        args.self_test.write_text(json.dumps({"ok": True, "qt": "loaded",
+                                             "svg": "rendered", "menus": "rendered",
+                                             "hid_accessed": False}), encoding="utf-8")
+        return 0
     set_app_user_model_id()
     if not QSystemTrayIcon.isSystemTrayAvailable():
         print("Windows 系统托盘不可用。", file=sys.stderr)
